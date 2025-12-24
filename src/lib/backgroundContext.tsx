@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect, ReactNode, useCallback } from 'react';
+import { createContext, useContext, useState, useEffect, ReactNode, useCallback, useRef } from 'react';
 
 interface BackgroundContextType {
   backgroundUrl: string;
@@ -11,13 +11,17 @@ const BackgroundContext = createContext<BackgroundContextType | undefined>(undef
 
 const BG_CACHE_KEY = 'app_background_cache';
 const BG_EXPIRE_TIME = 24 * 60 * 60 * 1000; // 24小时过期
+const BG_LOAD_TIMEOUT = 10000; // 10秒加载超时
 
 interface BackgroundCache {
   url: string;
   timestamp: number;
 }
 
-// 获取缓存的背景图片
+// 全局单例状态,防止页面切换时重新加载
+let globalBackgroundUrl: string | null = null;
+let globalIsLoaded = false;
+
 function getCachedBackground(): string | null {
   if (typeof window === 'undefined') return null;
 
@@ -28,7 +32,6 @@ function getCachedBackground(): string | null {
     const data: BackgroundCache = JSON.parse(cached);
     const now = Date.now();
 
-    // 检查是否过期
     if (now - data.timestamp > BG_EXPIRE_TIME) {
       localStorage.removeItem(BG_CACHE_KEY);
       return null;
@@ -40,7 +43,6 @@ function getCachedBackground(): string | null {
   }
 }
 
-// 保存背景图片到缓存
 function setCachedBackground(url: string): void {
   if (typeof window === 'undefined') return;
 
@@ -55,40 +57,101 @@ function setCachedBackground(url: string): void {
   }
 }
 
-// 获取新的随机背景图片
 function fetchNewBackground(): string {
-  // 使用时间戳作为查询参数，确保获取新图片
   return `https://loliapi.com/acg/?${Date.now()}`;
 }
 
+// 预加载图片并验证
+async function preloadImage(url: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const timeout = setTimeout(() => {
+      img.src = '';
+      resolve(false);
+    }, BG_LOAD_TIMEOUT);
+
+    img.onload = () => {
+      clearTimeout(timeout);
+      resolve(true);
+    };
+
+    img.onerror = () => {
+      clearTimeout(timeout);
+      resolve(false);
+    };
+
+    img.src = url;
+  });
+}
+
 export function BackgroundProvider({ children }: { children: ReactNode }) {
-  const [backgroundUrl, setBackgroundUrl] = useState<string>('');
-  const [isLoaded, setIsLoaded] = useState(false);
+  const [backgroundUrl, setBackgroundUrl] = useState<string>(globalBackgroundUrl || '');
+  const [isLoaded, setIsLoaded] = useState(globalIsLoaded);
+  const isInitializing = useRef(false);
 
   useEffect(() => {
-    // 首次加载时获取背景图片
-    const cached = getCachedBackground();
-
-    if (cached) {
-      // 使用缓存的图片
-      setBackgroundUrl(cached);
-    } else {
-      // 获取新图片
-      const newUrl = fetchNewBackground();
-      setBackgroundUrl(newUrl);
-      setCachedBackground(newUrl);
+    // 如果全局已有背景,直接使用
+    if (globalBackgroundUrl) {
+      setBackgroundUrl(globalBackgroundUrl);
+      setIsLoaded(globalIsLoaded);
+      return;
     }
+
+    // 防止重复初始化
+    if (isInitializing.current) return;
+    isInitializing.current = true;
+
+    const initBackground = async () => {
+      let finalUrl = '';
+
+      // 先尝试使用缓存
+      const cached = getCachedBackground();
+      if (cached) {
+        const isValid = await preloadImage(cached);
+        if (isValid) {
+          finalUrl = cached;
+        } else {
+          // 缓存的图片加载失败,清除缓存
+          localStorage.removeItem(BG_CACHE_KEY);
+        }
+      }
+
+      // 如果没有缓存或缓存失败,获取新图片
+      if (!finalUrl) {
+        const newUrl = fetchNewBackground();
+        const isValid = await preloadImage(newUrl);
+        if (isValid) {
+          finalUrl = newUrl;
+          setCachedBackground(newUrl);
+        }
+      }
+
+      // 更新全局和组件状态
+      if (finalUrl) {
+        globalBackgroundUrl = finalUrl;
+        setBackgroundUrl(finalUrl);
+      }
+    };
+
+    initBackground();
   }, []);
 
   const setLoaded = useCallback(() => {
+    globalIsLoaded = true;
     setIsLoaded(true);
   }, []);
 
-  const refreshBackground = useCallback(() => {
+  const refreshBackground = useCallback(async () => {
     const newUrl = fetchNewBackground();
-    setBackgroundUrl(newUrl);
-    setCachedBackground(newUrl);
-    setIsLoaded(false);
+    const isValid = await preloadImage(newUrl);
+
+    if (isValid) {
+      globalBackgroundUrl = newUrl;
+      globalIsLoaded = false;
+      setBackgroundUrl(newUrl);
+      setCachedBackground(newUrl);
+      setIsLoaded(false);
+    }
   }, []);
 
   return (
